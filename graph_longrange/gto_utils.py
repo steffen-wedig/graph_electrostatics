@@ -35,17 +35,14 @@ class RadialIntegralDirect(torch.nn.Module):
         exp_term = torch.exp(-0.5 * k2.unsqueeze(-1) * self.sigma2)
 
         if self.max_l == 0:
-            out = self.pref0 * exp_term
-            return out.unsqueeze(-1)
+            return (self.pref0 * exp_term).unsqueeze(-1)
 
-        out = torch.empty(
-            (*k_mods.shape, self.num_sigma, 2),
-            dtype=k_mods.dtype,
-            device=k_mods.device,
-        )
-        torch.mul(self.pref0, exp_term, out=out[..., 0])
-        torch.mul(self.pref1, k_mods.unsqueeze(-1) * exp_term, out=out[..., 1])
-        return out
+        # Out-of-place build (was torch.empty + torch.mul(out=...)). The `out=`
+        # form does not support autograd, which broke gradients once k_mods
+        # carries the cell/strain gradient (needed for the long-range stress).
+        col0 = self.pref0 * exp_term
+        col1 = self.pref1 * (k_mods.unsqueeze(-1) * exp_term)
+        return torch.stack((col0, col1), dim=-1)
 
 
 def _normalization_denominator(
@@ -145,9 +142,21 @@ class GTOBasis(torch.nn.Module):
     def _prepare_k_moduli(
         self, k_norm2: torch.Tensor, k0_mask: torch.Tensor
     ) -> torch.Tensor:
-        k_moduli = torch.sqrt(torch.clamp_min(k_norm2, 0.0))
-        k_moduli.masked_fill_(k0_mask > 0.0, 0.0)
-        return k_moduli
+        # KNOWN TRAP (NaN gradient at k=0): sqrt has an infinite derivative at
+        # 0, so differentiating sqrt(0) yields a NaN gradient. The k=(0,0,0)
+        # vector has k_norm2 == 0. The previous code took sqrt first and then
+        # masked the value in-place (masked_fill_), which is fine for the
+        # forward value but produces NaN *gradients* once k_norm2 carries the
+        # cell/strain gradient (long-range stress) -- silently giving NaN
+        # forces. Fix: substitute a dummy 1.0 at the k=0 entries BEFORE the
+        # sqrt, then zero them out with an out-of-place torch.where (whose
+        # selected-constant branch has exactly zero gradient).
+        k0 = k0_mask > 0.0
+        safe_k2 = torch.where(
+            k0, torch.ones_like(k_norm2), torch.clamp_min(k_norm2, 0.0)
+        )
+        k_moduli = torch.sqrt(safe_k2)
+        return torch.where(k0, torch.zeros_like(k_moduli), k_moduli)
 
     def _compute_ylmk(self, k_vectors: torch.Tensor) -> torch.Tensor:
         k_vectors = torch.index_select(k_vectors, -1, self.permute_indices)
@@ -160,12 +169,12 @@ class GTOBasis(torch.nn.Module):
         expanded_fnlk = torch.index_select(fnlk, -1, self.expanded_l_indices)
         xnlk = expanded_fnlk * yklm.unsqueeze(-2)
 
-        fourier_coefficients = torch.empty(
-            (*xnlk.size(), 2), dtype=xnlk.dtype, layout=xnlk.layout, device=xnlk.device
-        )
-        fourier_coefficients[..., 0] = xnlk * self.real_phase_factors
-        fourier_coefficients[..., 1] = xnlk * self.imag_phase_factors
-        return fourier_coefficients
+        # Out-of-place build (was torch.empty + slice assignment). In-place
+        # writes into an uninitialized tensor break autograd once the inputs
+        # carry the cell/strain gradient.
+        real = xnlk * self.real_phase_factors
+        imag = xnlk * self.imag_phase_factors
+        return torch.stack((real, imag), dim=-1)
 
     def forward(
         self,
