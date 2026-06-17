@@ -78,9 +78,9 @@ def apply_coulomb_kernel_batch(
         k_factor_coulomb[k_norm2 == 0] = 0.0
         k_factor_coulomb[k_norm2 != 0] = 1.0 / k_norm2[k_norm2 != 0]
     factor = k_factor_coulomb.reshape(-1, *([1] * (density.dim() - 1)))
-    potential = density * factor
-    potential.mul_(FIELD_CONSTANT)
-    return potential
+    # Out-of-place (was potential.mul_(FIELD_CONSTANT)). In-place mul breaks
+    # autograd once the density/k carry the cell/strain gradient.
+    return density * factor * FIELD_CONSTANT
 
 
 def project_to_features_batch(
