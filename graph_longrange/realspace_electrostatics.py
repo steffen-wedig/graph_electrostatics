@@ -24,38 +24,41 @@ def batch_complete_graph_excluding_self_duplicates_vector(
 
     Returns:
         edge_index (LongTensor[2, E])
+
+    Vectorized: the duplicated nodes are contiguous per graph (``batch`` is grouped
+    by graph and ``repeat_interleave`` preserves the grouping), so each graph's
+    block of pairs is built from a single global ``arange`` via per-graph offsets --
+    no Python loop over graphs, no per-graph ``nonzero``. Produces the same edge set
+    as the previous loop implementation (verified bit-identical).
     """
     batch = batch.long()
-    orig = torch.arange(batch.size(0), device=batch.device)
-    # duplicated per-node graph ID and original-ID
-    batch2 = batch.repeat_interleave(N)  # [M*N]
-    orig2 = orig.repeat_interleave(N)  # [M*N]
+    device = batch.device
+    num_original_nodes = batch.size(0)
+    # duplicated per-node graph ID and original-ID (grouped by graph)
+    original_ids = torch.arange(num_original_nodes, device=device).repeat_interleave(N)  # [M*N]
+    duplicated_batch = batch.repeat_interleave(N)  # [M*N]
+    if duplicated_batch.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
 
-    G = int(batch2.max().item()) + 1
-    edges = []
+    num_graphs = int(duplicated_batch.max().item()) + 1
+    nodes_per_graph = torch.bincount(duplicated_batch, minlength=num_graphs)  # duplicated nodes / graph
+    graph_offsets = torch.cumsum(nodes_per_graph, 0) - nodes_per_graph  # block start / graph
+    pairs_per_graph = nodes_per_graph * nodes_per_graph  # ordered pairs / graph
+    total_pairs = int(pairs_per_graph.sum().item())
+    if total_pairs == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
 
-    for g in range(G):
-        # pick out all duplicates in graph g
-        mask = batch2 == g
-        nodes = mask.nonzero(as_tuple=False).view(-1)  # [D]
-        if nodes.numel() <= 1:
-            continue
+    # graph id of each ordered pair, and the pair's index within its graph block
+    pair_graph = torch.arange(num_graphs, device=device).repeat_interleave(pairs_per_graph)  # [P]
+    pair_block_offsets = torch.cumsum(pairs_per_graph, 0) - pairs_per_graph  # [num_graphs]
+    local_pair = torch.arange(total_pairs, device=device) - pair_block_offsets[pair_graph]  # 0..count^2-1
+    graph_size = nodes_per_graph[pair_graph]
 
-        # 1 big mesh of every pair in this graph
-        D = nodes.size(0)
-        row = nodes.view(-1, 1).expand(-1, D).reshape(-1)
-        col = nodes.view(1, -1).expand(D, -1).reshape(-1)
-
-        # mask out pairs where orig2 is the same
-        orig_row = orig2[mask].view(-1, 1).expand(-1, D).reshape(-1)
-        orig_col = orig2[mask].view(1, -1).expand(D, -1).reshape(-1)
-        keep = orig_row != orig_col
-
-        edges.append(torch.stack([row[keep], col[keep]], dim=0))
-
-    if not edges:
-        return torch.empty((2, 0), dtype=torch.long, device=batch.device)
-    return torch.cat(edges, dim=1)
+    row = graph_offsets[pair_graph] + torch.div(local_pair, graph_size, rounding_mode="floor")
+    col = graph_offsets[pair_graph] + local_pair % graph_size
+    # drop pairs whose duplicates come from the same original node (incl. self pairs)
+    keep = original_ids[row] != original_ids[col]
+    return torch.stack([row[keep], col[keep]], dim=0)
 
 
 def charges_energy_from_graph(
