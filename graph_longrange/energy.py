@@ -38,8 +38,20 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         kspace_cutoff: float,
         include_self_interaction: bool = False,
         include_pbc_corrections: bool = True,
+        pbc_handling=None,
     ):
         super().__init__()
+        # Back-compat: pre-0.3.16 callers (e.g. mace-scf's LocalSplitCharges) construct
+        # this with pbc_handling=<str> and later read `.pbc_handling`. Map that onto the
+        # current include_pbc_corrections flag and keep the attribute available. The
+        # realspace-vs-periodic dispatch in forward() is driven by the runtime `pbc`
+        # tensor, so this only affects whether the monopole/dipole/slab corrections are
+        # applied on the periodic path.
+        if pbc_handling is not None:
+            self.pbc_handling = pbc_handling
+            include_pbc_corrections = pbc_handling != "realspace"
+        else:
+            self.pbc_handling = "mixed_periodic" if include_pbc_corrections else "realspace"
         self.density_max_l = density_max_l
         self.density_smearing_width = density_smearing_width
         self.kspace_cutoff = kspace_cutoff
