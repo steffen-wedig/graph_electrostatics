@@ -391,6 +391,17 @@ class GTOElectrostaticFeatures(torch.nn.Module):
 
         self.static_quantities = None
 
+    def set_pbc_handling(self, pbc_handling: str) -> None:
+        """Back-compat no-op setter for callers (e.g. mace-scf's FixedPoint
+        calculator) that select the mode after construction.
+
+        This module chooses its correction mode (periodic / molecule / slab) per
+        graph from the runtime ``pbc`` tensor (see ``_build_correction_cache``), so
+        there is no stored pbc-handling flag to change. The value is kept only for
+        introspection.
+        """
+        self.pbc_handling = pbc_handling
+
     @staticmethod
     def _as_volume_scalar(volume: torch.Tensor) -> torch.Tensor:
         return volume.item()

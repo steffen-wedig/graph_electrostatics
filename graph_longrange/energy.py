@@ -79,6 +79,18 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         )
         self.monopole_dipole_correction = MonopoleDipoleCorrectionBlock(density_max_l)
 
+    def set_pbc_handling(self, pbc_handling: str) -> None:
+        """Back-compat setter for callers (e.g. mace-scf's LocalSplitCharges
+        calculator) that select the electrostatics mode after construction.
+
+        Mirrors the ``pbc_handling`` mapping in ``__init__``. The realspace-vs-periodic
+        dispatch in ``forward`` is driven by the runtime ``pbc`` tensor, so this only
+        toggles whether the monopole/dipole/slab corrections are applied on the
+        periodic path (``include_pbc_corrections``).
+        """
+        self.pbc_handling = pbc_handling
+        self.include_pbc_corrections = pbc_handling != "realspace"
+
     def forward(
         self,
         k_vectors: torch.Tensor,
