@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 from mace.tools.scatter import scatter_sum
@@ -83,37 +83,76 @@ def _smeared_coulomb_kernels_closed_form(
     return kernels
 
 
+class SmearedCoulombKernels(NamedTuple):
+    """Radial kernels B_n(R) of the Coulomb interaction between two Gaussians.
+
+    With combined_smearing_width^2 = width_1^2 + width_2^2 the zeroth kernel is
+    B_0(R) = erf(R / (sqrt(2) * combined_smearing_width)) / R, the interaction of
+    two unit Gaussian charges. Each higher kernel is the radial derivative of
+    the previous one, B_{n+1}(R) = -(1/R) dB_n/dR, so with separation vector R
+    (receiver minus sender) the multipole interaction terms read:
+
+        charge-charge     q_s q_r B_0
+        charge-dipole     (q_s (p_r . R) - q_r (p_s . R)) B_1
+        dipole-dipole     (p_s . p_r) B_1 - (p_s . R)(p_r . R) B_2
+
+    Equivalently B_1 R is the field of a unit charge and B_1 I - B_2 R R^T the
+    field gradient. All kernels are finite at R = 0. Kernels above the requested
+    order are None; every present kernel is broadcast to the common shape of
+    distance_squared and combined_smearing_width.
+    """
+
+    b0: torch.Tensor
+    b1: torch.Tensor | None = None
+    b2: torch.Tensor | None = None
+
+
 def smeared_coulomb_kernels(
     distance_squared: torch.Tensor,
     combined_smearing_width,
     highest_order: int,
-) -> list[torch.Tensor]:
-    """Radial kernels of the Coulomb interaction between two Gaussian densities.
+) -> SmearedCoulombKernels:
+    """Evaluate the smeared-Coulomb kernels B_0..B_highest_order for pairs.
 
-    The zeroth kernel is B_0(R) = erf(R / (sqrt(2) * combined_smearing_width)) / R,
-    the interaction of two unit Gaussian charges whose widths combine as
-    combined_smearing_width^2 = width_1^2 + width_2^2. Higher kernels follow the
-    derivative chain B_{n+1}(R) = -(1/R) dB_n/dR, so that dipole interaction
-    tensors are built from B_1 and B_2. All kernels are finite at R = 0.
+    See SmearedCoulombKernels for the definition of the kernels and how they
+    combine into charge and dipole interactions.
+
+    Two branches are needed because neither evaluation is accurate on the
+    whole axis. The closed form obtains B_{n+1} from B_n by the upward
+    recursion B_{n+1} = ((2n+1) B_n - g(R)) / R^2 with a Gaussian g(R): as
+    R -> 0 the numerator is a difference of nearly equal terms divided by a
+    vanishing R^2 (and B_0 = erf(.)/R itself is 0/0), so each order loses
+    more digits and B_2 is unusable well before R reaches zero. The Taylor
+    series in R^2 / (2 Sigma^2) is exact at R = 0 and free of cancellation,
+    but it is alternating with terms that grow before they decay, so its cost
+    and rounding error grow with the argument and it cannot replace the
+    closed form at large R. Below SERIES_CROSSOVER the series is used, where
+    SERIES_NUM_TERMS terms reach 1e-12; above it the closed form is used,
+    where the recursion has lost at most a few digits. Both branches are
+    evaluated on every pair and selected with torch.where so that autograd
+    sees a single smooth expression on each side of the crossover.
 
     Args:
         distance_squared: squared pair distances, broadcastable against
             combined_smearing_width (e.g. [n_edges] with a scalar width, or
             [n_edges, 1] with a [n_radial] width tensor).
         combined_smearing_width: float or tensor of combined Gaussian widths.
-        highest_order: largest kernel order to return (0, 1, or 2 for l <= 1).
+        highest_order: largest kernel order to evaluate: 0 for charges only,
+            1 for charge-dipole terms, 2 for dipole-dipole terms.
 
     Returns:
-        List of highest_order + 1 tensors, each broadcast to the common shape.
+        SmearedCoulombKernels with b0..b_highest_order filled and the rest None.
     """
-    if highest_order < 0:
-        raise ValueError("highest_order must be non-negative")
+    if highest_order not in (0, 1, 2):
+        raise ValueError(
+            f"highest_order must be 0, 1 or 2 (l <= 1), got {highest_order}"
+        )
     # Further work (performance): both branches are evaluated for every edge,
     # and the unrolled series alone emits ~40 small elementwise kernels, so
     # batches of many tiny graphs are launch-overhead bound (0.6-0.8x vs the
     # finite-difference modules on B200; every larger regime wins). The whole
     # chain is straight-line elementwise math and should fuse into a few
-    # kernels under torch.compile — untested; verify compilation and double
+    # kernels under torch.compile. TODO: verify compilation and double
     # backward before relying on it.
     scaled_distance_squared = distance_squared / (
         2.0 * combined_smearing_width**2
@@ -131,12 +170,15 @@ def smeared_coulomb_kernels(
         combined_smearing_width,
         highest_order,
     )
-    return [
-        torch.where(in_series_branch, series_kernel, closed_form_kernel)
-        for series_kernel, closed_form_kernel in zip(
-            series_kernels, closed_form_kernels
+    return SmearedCoulombKernels(
+        *(
+            torch.where(in_series_branch, series_kernel, closed_form_kernel)
+            for series_kernel, closed_form_kernel in zip(
+                series_kernels, closed_form_kernels
+            )
         )
-    ]
+    )
+
 
 @torch.no_grad()
 def batch_complete_graph_excluding_self_duplicates_vector(
@@ -671,7 +713,7 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
         )
 
         charges = source_feats[:, 0]
-        pair_energy = charges[sender] * charges[receiver] * kernels[0]
+        pair_energy = charges[sender] * charges[receiver] * kernels.b0
 
         if self.density_max_l >= 1:
             dipoles = source_feats[:, E3NN_TO_CARTESIAN_COLUMNS]  # [n_nodes, 3] (x, y, z)
@@ -686,16 +728,16 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
             pair_energy = pair_energy - (
                 charges[sender] * receiver_dipole_along_separation
                 - charges[receiver] * sender_dipole_along_separation
-            ) * kernels[1]
+            ) * kernels.b1
             pair_energy = (
                 pair_energy
-                + torch.sum(sender_dipoles * receiver_dipoles, dim=-1) * kernels[1]
+                + torch.sum(sender_dipoles * receiver_dipoles, dim=-1) * kernels.b1
             )
             pair_energy = (
                 pair_energy
                 - sender_dipole_along_separation
                 * receiver_dipole_along_separation
-                * kernels[2]
+                * kernels.b2
             )
 
         edge_energy = 0.5 * FIELD_CONSTANT / (4 * pi) * pair_energy
@@ -846,7 +888,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
         charges = source_feats[:, 0]
         sender_charges = charges[sender].unsqueeze(-1)  # [n_edges, 1]
 
-        scalar_edge_features = sender_charges * kernels[0]
+        scalar_edge_features = sender_charges * kernels.b0
         if self.density_max_l >= 1:
             dipoles = source_feats[:, E3NN_TO_CARTESIAN_COLUMNS]  # (x, y, z)
             sender_dipoles = dipoles[sender]  # [n_edges, 3]
@@ -854,7 +896,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
                 sender_dipoles * separation, dim=-1, keepdim=True
             )  # [n_edges, 1]
             scalar_edge_features = (
-                scalar_edge_features + sender_dipole_along_separation * kernels[1]
+                scalar_edge_features + sender_dipole_along_separation * kernels.b1
             )
 
         scalar_features = scatter_sum(
@@ -871,15 +913,15 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             gradient_edge_features = (
                 -sender_charges.unsqueeze(-1)
                 * separation.unsqueeze(1)
-                * kernels[1].unsqueeze(-1)
+                * kernels.b1.unsqueeze(-1)
             )
             if self.density_max_l >= 1:
                 gradient_edge_features = (
                     gradient_edge_features
-                    + sender_dipoles.unsqueeze(1) * kernels[1].unsqueeze(-1)
+                    + sender_dipoles.unsqueeze(1) * kernels.b1.unsqueeze(-1)
                     - sender_dipole_along_separation.unsqueeze(-1)
                     * separation.unsqueeze(1)
-                    * kernels[2].unsqueeze(-1)
+                    * kernels.b2.unsqueeze(-1)
                 )
 
             gradient_features = scatter_sum(

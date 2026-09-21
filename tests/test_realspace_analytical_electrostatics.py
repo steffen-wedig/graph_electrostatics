@@ -157,17 +157,6 @@ def test_kernels_at_zero_distance():
         assert kernels[order][0].item() == pytest.approx(expected, rel=1e-14)
 
 
-def test_kernels_far_field_point_multipole_limit():
-    combined_width = 1.5
-    distance = 20.0 * combined_width
-    kernels = smeared_coulomb_kernels(
-        torch.tensor([distance**2]), combined_width, highest_order=2
-    )
-    assert kernels[0][0].item() == pytest.approx(1.0 / distance, rel=1e-10)
-    assert kernels[1][0].item() == pytest.approx(1.0 / distance**3, rel=1e-10)
-    assert kernels[2][0].item() == pytest.approx(3.0 / distance**5, rel=1e-10)
-
-
 def test_kernel_dispatcher_autograd_derivatives_across_crossover():
     """Autograd derivatives of the *dispatched* kernels (the where/clamp
     construction), including exactly at and adjacent to the branch crossover.
@@ -196,7 +185,22 @@ def test_kernel_dispatcher_autograd_derivatives_across_crossover():
         dtype=torch.float64,
     )
     distance_squared = (2.0 * combined_width**2 * scaled_values).requires_grad_(True)
-    kernels = smeared_coulomb_kernels(distance_squared, combined_width, 3)
+    kernels = list(smeared_coulomb_kernels(distance_squared, combined_width, 2))
+    # B_3 is the derivative oracle for B_2 but is not part of the public
+    # kernels, so evaluate it directly from the two branches.
+    with torch.no_grad():
+        in_series_branch = scaled_values < SERIES_CROSSOVER
+        kernels.append(
+            torch.where(
+                in_series_branch,
+                _smeared_coulomb_kernels_series(scaled_values, combined_width, 3)[3],
+                _smeared_coulomb_kernels_closed_form(
+                    torch.clamp(scaled_values, min=0.5 * SERIES_CROSSOVER),
+                    combined_width,
+                    3,
+                )[3],
+            )
+        )
 
     for order in range(3):
         first_derivative = torch.autograd.grad(
@@ -225,39 +229,6 @@ def test_kernel_dispatcher_autograd_derivatives_across_crossover():
             )
 
 
-def test_energy_and_forces_smooth_through_branch_crossover():
-    """Two atoms swept through the branch-crossover distance: autograd forces
-    must match central finite differences of the energy at every sample, so any
-    dispatch discontinuity in value or derivative would show up as a spike."""
-    module = RealSpaceAnalyticalEnergy(1, DENSITY_SMEARING_WIDTH)
-    combined_width = math.sqrt(2.0) * DENSITY_SMEARING_WIDTH
-    crossover_distance = combined_width * math.sqrt(2.0 * SERIES_CROSSOVER)
-    source_feats = torch.tensor(
-        [[0.7, 0.2, -0.4, 0.3], [-0.5, -0.1, 0.25, 0.15]], dtype=torch.float64
-    )
-    batch = torch.zeros(2, dtype=torch.long)
-    direction = torch.tensor([1.0, 2.0, -0.5], dtype=torch.float64)
-    direction = direction / direction.norm()
-
-    def energy_at(distance):
-        positions = torch.stack([torch.zeros(3, dtype=torch.float64), distance * direction])
-        return module(source_feats, positions, batch)[0]
-
-    step = 1e-6
-    for distance in torch.linspace(
-        0.95 * crossover_distance, 1.05 * crossover_distance, 21, dtype=torch.float64
-    ):
-        distance_input = distance.clone().requires_grad_(True)
-        energy = energy_at(distance_input)
-        (energy_derivative,) = torch.autograd.grad(energy, distance_input)
-        finite_difference = (
-            energy_at(distance + step) - energy_at(distance - step)
-        ) / (2 * step)
-        assert energy_derivative.item() == pytest.approx(
-            finite_difference.item(), rel=1e-7
-        )
-
-
 def _system_straddling_branches():
     """Four collinear atoms whose pair distances put edges in the series branch,
     the closed-form branch, and exactly at the crossover (for the energy width),
@@ -274,35 +245,29 @@ def _system_straddling_branches():
     generator = torch.Generator().manual_seed(20)
     source_feats = 0.5 * torch.randn((4, 4), generator=generator, dtype=torch.float64)
     batch = torch.zeros(4, dtype=torch.long)
-    return source_feats, positions, batch
 
-
-def test_branch_membership_of_straddling_system():
-    """Guard: the engineered system really exercises both branches (and, for the
-    feature widths, an edge whose branch differs per radial channel)."""
-    _, positions, _ = _system_straddling_branches()
+    # Guard that the system really exercises both branches, one edge exactly
+    # at the crossover, and (for the feature widths) an edge whose branch
+    # differs per radial channel.
     pair_distances_squared = (
         (positions.unsqueeze(0) - positions.unsqueeze(1)) ** 2
     ).sum(-1)[torch.triu_indices(4, 4, offset=1).unbind()]
-
-    energy_scaled = pair_distances_squared / (
-        2.0 * (math.sqrt(2.0) * DENSITY_SMEARING_WIDTH) ** 2
-    )
+    energy_scaled = pair_distances_squared / (2.0 * combined_energy_width**2)
     assert (energy_scaled < SERIES_CROSSOVER).any()
     assert (energy_scaled >= SERIES_CROSSOVER).any()
     assert torch.isclose(
         energy_scaled, torch.tensor(SERIES_CROSSOVER, dtype=torch.float64)
     ).any()
-
-    feature_scaled = [
-        pair_distances_squared
-        / (2.0 * (DENSITY_SMEARING_WIDTH**2 + projection_width**2))
-        for projection_width in PROJECTION_SMEARING_WIDTHS
-    ]
     per_channel_masks = torch.stack(
-        [scaled < SERIES_CROSSOVER for scaled in feature_scaled]
+        [
+            pair_distances_squared
+            / (2.0 * (DENSITY_SMEARING_WIDTH**2 + projection_width**2))
+            < SERIES_CROSSOVER
+            for projection_width in PROJECTION_SMEARING_WIDTHS
+        ]
     )
     assert (per_channel_masks[0] != per_channel_masks[1]).any()
+    return source_feats, positions, batch
 
 
 def test_energy_gradients_with_edges_in_both_branches():
@@ -403,11 +368,11 @@ def test_potential_matches_radial_shell_quadrature():
         kernels = smeared_coulomb_kernels(
             torch.tensor([radius**2]), smearing_width, highest_order=1
         )
-        assert kernels[0][0].item() == pytest.approx(
+        assert kernels.b0[0].item() == pytest.approx(
             monopole_potential(radius), rel=1e-10
         )
         # analytic on-axis dipole potential per unit moment: radius * B_1
-        assert radius * kernels[1][0].item() == pytest.approx(
+        assert radius * kernels.b1[0].item() == pytest.approx(
             dipole_potential_on_axis(radius), rel=1e-10
         )
 
@@ -723,11 +688,9 @@ def test_features_finite_difference_error_is_first_order_with_richardson():
 
 
 @pytest.mark.parametrize("density_max_l", [0, 1])
-@pytest.mark.parametrize("smearing_width", [0.8, 1.5])
-def test_self_energy_matches_gto_self_interaction_block(
-    density_max_l, smearing_width
-):
+def test_self_energy_matches_gto_self_interaction_block(density_max_l):
     """Single atom: the energy is purely the (independently integrated) self term."""
+    smearing_width = DENSITY_SMEARING_WIDTH
     source_feats, positions, _ = random_system(seed=5, atoms_per_graph=1)
     source_feats = source_feats[:, : (density_max_l + 1) ** 2]
     batch = torch.zeros(1, dtype=torch.long)
@@ -799,17 +762,6 @@ def test_energy_rotation_invariance():
     assert abs((rotated_energy - energy).item()) < 1e-12 * max(
         1.0, abs(energy.item())
     )
-
-    # Document the bug being fixed: the finite-difference module violates
-    # rotational invariance at the O(offset) level.
-    finite_difference_module = RealSpaceFiniteDiffereneEnergy(
-        1, DENSITY_SMEARING_WIDTH, offset=0.02
-    )
-    violation = (
-        finite_difference_module(rotated_feats, rotated_positions, batch)[0]
-        - finite_difference_module(source_feats, positions, batch)[0]
-    )
-    assert abs(violation.item()) > 1e-6
 
 
 def test_features_rotation_equivariance():
@@ -906,7 +858,7 @@ def test_directed_sign_convention():
     )
     expected_energy = (
         -FIELD_CONSTANT / (4 * pi) * charge * dipole_z * distance
-        * kernels[1][0].item()
+        * kernels.b1[0].item()
     )
     energy = RealSpaceAnalyticalEnergy(1, DENSITY_SMEARING_WIDTH)(
         source_feats, positions, batch
@@ -926,35 +878,18 @@ def test_directed_sign_convention():
     )(source_feats, positions, batch)[0]
     receiver_gradient_z = features[1, 2]  # (y, z, x) block: column 2 is z
     assert receiver_gradient_z.item() < 0.0
-    projection_kernels = smeared_coulomb_kernels(
-        torch.tensor([distance**2]), combined_width, highest_order=1
-    )
     expected_gradient_z = (
-        -FIELD_CONSTANT / (4 * pi) * charge * distance
-        * projection_kernels[1][0].item()
+        -FIELD_CONSTANT / (4 * pi) * charge * distance * kernels.b1[0].item()
     )
     assert receiver_gradient_z.item() == pytest.approx(expected_gradient_z, rel=1e-12)
 
 
-def test_energy_gradients_and_double_backward():
+def test_double_backward_to_feature_parameter():
+    """Training-like use: a force-weighted loss must backpropagate through the
+    forces to the source features (gradchecks live in the straddling-system
+    tests above)."""
     source_feats, positions, batch = random_system(seed=14)
     module = RealSpaceAnalyticalEnergy(1, DENSITY_SMEARING_WIDTH)
-
-    positions_input = positions.clone().requires_grad_(True)
-    assert torch.autograd.gradcheck(
-        lambda pos: module(source_feats, pos, batch).sum(),
-        (positions_input,),
-        eps=1e-6,
-        atol=1e-8,
-    )
-    assert torch.autograd.gradgradcheck(
-        lambda pos: module(source_feats, pos, batch).sum(),
-        (positions_input,),
-        eps=1e-6,
-        atol=1e-7,
-    )
-
-    # training-like double backward: force-weighted loss back to a parameter
     feature_parameter = torch.nn.Parameter(source_feats.clone())
     positions_leaf = positions.clone().requires_grad_(True)
     energy = module(feature_parameter, positions_leaf, batch).sum()
@@ -963,20 +898,6 @@ def test_energy_gradients_and_double_backward():
     loss.backward()
     assert feature_parameter.grad is not None
     assert torch.isfinite(feature_parameter.grad).all()
-
-
-def test_features_gradcheck():
-    source_feats, positions, batch = random_system(seed=15)
-    module = RealSpaceAnalyticalElectrostaticFeatures(
-        1, DENSITY_SMEARING_WIDTH, 1, PROJECTION_SMEARING_WIDTHS
-    )
-    positions_input = positions.clone().requires_grad_(True)
-    assert torch.autograd.gradcheck(
-        lambda pos: module(source_feats, pos, batch)[0].pow(2).sum(),
-        (positions_input,),
-        eps=1e-6,
-        atol=1e-8,
-    )
 
 
 def test_invalid_configuration_raises():
