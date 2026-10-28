@@ -916,3 +916,25 @@ def test_invalid_configuration_raises():
         RealSpaceAnalyticalEnergy(0, DENSITY_SMEARING_WIDTH)(
             source_feats, positions, batch
         )
+
+
+def test_energy_and_forces_compile_into_one_graph():
+    # The analytical energy is what a compiled LSC training step evaluates:
+    # energies and position gradients must match eager over changing batches.
+    module = RealSpaceAnalyticalEnergy(1, DENSITY_SMEARING_WIDTH)
+    with torch._dynamo.config.patch(
+        capture_scalar_outputs=True, capture_dynamic_output_shape_ops=True
+    ):
+        torch._dynamo.reset()
+        compiled = torch.compile(module, backend="aot_eager", fullgraph=True, dynamic=True)
+        generator = torch.Generator().manual_seed(7)
+        for sizes in ([3, 7, 5], [4, 4], [2, 9, 1, 6]):
+            batch = torch.repeat_interleave(torch.arange(len(sizes)), torch.tensor(sizes))
+            positions = (3.0 * torch.randn(batch.numel(), 3, generator=generator)).requires_grad_()
+            source_feats = torch.randn(batch.numel(), 4, generator=generator)
+            expected = module(source_feats, positions, batch)
+            (expected_forces,) = torch.autograd.grad(expected.sum(), positions)
+            result = compiled(source_feats, positions, batch)
+            (forces,) = torch.autograd.grad(result.sum(), positions)
+            torch.testing.assert_close(result, expected, rtol=1e-12, atol=1e-12)
+            torch.testing.assert_close(forces, expected_forces, rtol=1e-12, atol=1e-12)

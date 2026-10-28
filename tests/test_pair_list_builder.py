@@ -78,3 +78,24 @@ def test_builder_edge_count_formula():
     )
     expected_count = (num_nodes * num_duplicates) ** 2 - num_nodes * num_duplicates**2
     assert edge_index.shape[1] == expected_count
+
+
+def test_builder_compiles_into_one_graph():
+    # No branch on tensor values: with the data-dependent edge count captured,
+    # torch.compile traces the builder whole, for uniform and mixed batches.
+    with torch._dynamo.config.patch(
+        capture_scalar_outputs=True, capture_dynamic_output_shape_ops=True
+    ):
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            batch_complete_graph_excluding_self_duplicates_vector,
+            backend="aot_eager",
+            fullgraph=True,
+            dynamic=True,
+        )
+        for batch in ([0, 0, 0, 1, 1, 1], [0, 0, 1, 1, 1, 2], [0, 1, 1, 1, 1, 2, 2]):
+            batch_tensor = torch.tensor(batch, dtype=torch.long)
+            for num_duplicates in (1, 4):
+                assert edge_set_from_tensor(
+                    compiled(batch_tensor, num_duplicates)
+                ) == reference_edge_set(batch, num_duplicates)
