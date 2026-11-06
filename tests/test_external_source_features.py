@@ -56,6 +56,7 @@ def _base():
         include_self_interaction=False,
         kspace_cutoff=4.0,
         pbc_handling="realspace",
+        realspace_method="finite_difference",  # the source-target terms are finite-difference only
     )
 
 

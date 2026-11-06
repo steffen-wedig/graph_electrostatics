@@ -16,6 +16,7 @@ from .realspace_electrostatics import (
     RealSpaceFiniteDifferenceElectrostaticFeatures,
     RealSpaceMethod,
     _match_tensor_placement,
+    _upgrade_legacy_realspace,
 )
 from .slabs import (
     CorrectivePotentialBlock,
@@ -294,7 +295,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         quadrupole_feature_corrections: bool = False,
         integral_normalization: str = "receiver",
         pbc_handling: FeaturePBCHandling = "mixed_periodic",
-        realspace_method: RealSpaceMethod = "finite_difference",
+        realspace_method: RealSpaceMethod = "analytical",
     ):
         super().__init__()
         self.density_basis = GTOBasis(
@@ -409,12 +410,16 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self._precompute_geometry_impl = self._select_precompute_geometry_impl()
         self._forward_dynamic_impl = self._select_forward_dynamic_impl()
 
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        _upgrade_legacy_realspace(self, state)
+
     def set_realspace_method(self, realspace_method: RealSpaceMethod) -> None:
         """Swap the non-periodic evaluator on an already-built block.
 
         The analytical evaluator is exactly rotationally equivariant; the
-        finite-difference one is what existing weights were fitted against, so it
-        stays the default and this setter is the opt-in for an existing model.
+        finite-difference one (graph_longrange <= v0.4.4) is orientation dependent.
+        Analytical is the default; legacy pickles are upgraded on load.
         """
         old = self.realspace_features
         reference = next(

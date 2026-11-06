@@ -96,15 +96,60 @@ def run_features_block(block, source_feats, positions, batch):
     )
 
 
-def test_default_selects_finite_difference():
-    """The default must stay finite difference: existing weights were fit to it."""
-    assert isinstance(
-        make_energy_block().realspace_energy, RealSpaceFiniteDiffereneEnergy
-    )
+def test_default_selects_analytical():
+    """The default is the rotation-invariant analytical evaluator."""
+    assert isinstance(make_energy_block().realspace_energy, RealSpaceAnalyticalEnergy)
     assert isinstance(
         make_features_block().realspace_features,
-        RealSpaceFiniteDifferenceElectrostaticFeatures,
+        RealSpaceAnalyticalElectrostaticFeatures,
     )
+
+
+def _legacy_pickle(block):
+    """A whole-block pickle as graph_longrange <= v0.4.4 wrote it: finite-difference
+    evaluator, no ``realspace_method`` attribute."""
+    del block.realspace_method
+    buffer = io.BytesIO()
+    torch.save(block, buffer)
+    buffer.seek(0)
+    return buffer
+
+
+@pytest.mark.parametrize("kind", ["energy", "features"])
+def test_legacy_pickle_is_upgraded_to_analytical(kind):
+    source_feats, positions, batch = random_system()
+    if kind == "energy":
+        legacy = make_energy_block(realspace_method="finite_difference")
+        reference = make_energy_block(realspace_method="analytical")
+        attribute, expected, run = (
+            "realspace_energy",
+            RealSpaceAnalyticalEnergy,
+            run_energy_block,
+        )
+    else:
+        legacy = make_features_block(realspace_method="finite_difference")
+        reference = make_features_block(realspace_method="analytical")
+        attribute, expected, run = (
+            "realspace_features",
+            RealSpaceAnalyticalElectrostaticFeatures,
+            run_features_block,
+        )
+    restored = torch.load(_legacy_pickle(legacy), weights_only=False)
+    assert isinstance(getattr(restored, attribute), expected)
+    assert restored.realspace_method == "analytical"
+    torch.testing.assert_close(
+        run(restored, source_feats, positions, batch),
+        run(reference, source_feats, positions, batch),
+    )
+
+
+def test_explicit_finite_difference_survives_a_round_trip():
+    block = make_energy_block(realspace_method="finite_difference")
+    buffer = io.BytesIO()
+    torch.save(block, buffer)
+    buffer.seek(0)
+    restored = torch.load(buffer, weights_only=False)
+    assert isinstance(restored.realspace_energy, RealSpaceFiniteDiffereneEnergy)
 
 
 def test_analytical_flag_selects_analytical_modules():
@@ -160,7 +205,7 @@ def test_setter_swaps_evaluator_and_changes_output():
     """set_realspace_method must rebuild the evaluator and take effect immediately."""
     source_feats, positions, batch = random_system()
 
-    energy_block = make_energy_block()
+    energy_block = make_energy_block(realspace_method="finite_difference")
     finite_difference_energy = run_energy_block(
         energy_block, source_feats, positions, batch
     )
@@ -179,7 +224,7 @@ def test_setter_swaps_evaluator_and_changes_output():
     # Same physics, different discretization: close but not identical.
     assert not torch.allclose(analytical_energy, finite_difference_energy)
 
-    features_block = make_features_block()
+    features_block = make_features_block(realspace_method="finite_difference")
     features_block.set_realspace_method("analytical")
     assert isinstance(
         features_block.realspace_features, RealSpaceAnalyticalElectrostaticFeatures
@@ -217,14 +262,16 @@ def test_setter_preserves_dtype_and_keeps_integer_buffers_integral():
     )
 
 
-def test_default_state_dict_is_unchanged_by_the_flag():
-    """Old checkpoints must still load strictly into a default-built block."""
-    energy_keys = set(make_energy_block().state_dict())
+def test_finite_difference_state_dict_keeps_its_buffers():
+    """Old checkpoints load strictly into an explicitly finite-difference block."""
+    energy_keys = set(make_energy_block(realspace_method="finite_difference").state_dict())
     assert "realspace_energy.x" in energy_keys
     assert "realspace_energy.y" in energy_keys
     assert "realspace_energy.z" in energy_keys
 
-    features_keys = set(make_features_block().state_dict())
+    features_keys = set(
+        make_features_block(realspace_method="finite_difference").state_dict()
+    )
     assert "realspace_features.l0_factors" in features_keys
     assert "realspace_features.total_width_factors" in features_keys
 
@@ -237,7 +284,9 @@ def test_analytical_state_dict_is_a_subset_of_the_finite_difference_one():
     cross-arm load silently install the wrong constants.
     """
     for make_block in (make_energy_block, make_features_block):
-        finite_difference_keys = set(make_block().state_dict())
+        finite_difference_keys = set(
+            make_block(realspace_method="finite_difference").state_dict()
+        )
         analytical_keys = set(make_block(realspace_method="analytical").state_dict())
         assert analytical_keys < finite_difference_keys
         assert not any("l0_factors" in key for key in analytical_keys)
@@ -247,7 +296,9 @@ def test_analytical_state_dict_is_a_subset_of_the_finite_difference_one():
 
 def test_finite_difference_checkpoint_loads_into_analytical_block_without_corruption():
     """A non-strict cross-arm load must leave the analytical constants intact."""
-    finite_difference_state = make_features_block().state_dict()
+    finite_difference_state = make_features_block(
+        realspace_method="finite_difference"
+    ).state_dict()
     analytical_block = make_features_block(realspace_method="analytical")
     expected_l1 = analytical_block.realspace_features.l1_factors.clone()
 
@@ -269,10 +320,10 @@ def test_legacy_pickle_without_the_flag_still_runs_and_can_be_switched():
     """
     source_feats, positions, batch = random_system()
 
-    energy_block = make_energy_block()
+    energy_block = make_energy_block(realspace_method="finite_difference")
     del energy_block.realspace_method
     expected = run_energy_block(
-        make_energy_block(), source_feats, positions, batch
+        make_energy_block(realspace_method="finite_difference"), source_feats, positions, batch
     )
     torch.testing.assert_close(
         run_energy_block(energy_block, source_feats, positions, batch), expected
@@ -280,11 +331,16 @@ def test_legacy_pickle_without_the_flag_still_runs_and_can_be_switched():
     energy_block.set_realspace_method("analytical")
     assert isinstance(energy_block.realspace_energy, RealSpaceAnalyticalEnergy)
 
-    features_block = make_features_block()
+    features_block = make_features_block(realspace_method="finite_difference")
     del features_block.realspace_method
     torch.testing.assert_close(
         run_features_block(features_block, source_feats, positions, batch),
-        run_features_block(make_features_block(), source_feats, positions, batch),
+        run_features_block(
+            make_features_block(realspace_method="finite_difference"),
+            source_feats,
+            positions,
+            batch,
+        ),
     )
     features_block.set_realspace_method("analytical")
     assert isinstance(

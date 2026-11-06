@@ -945,3 +945,18 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             features = features + self_interaction_terms
 
         return features, self_interaction_terms, None
+
+
+def _upgrade_legacy_realspace(block, state) -> None:
+    """Move a whole-model pickle written before ``realspace_method`` existed
+    (graph_longrange <= v0.4.4) onto the analytical evaluator.
+
+    Such pickles hold the finite-difference evaluator, whose lab-frame displaced
+    charges make non-periodic energies orientation dependent (ACEsuit/mace#1719).
+    A pickle that records its ``realspace_method`` keeps it, so an explicit
+    finite-difference choice survives a save/load round trip.
+    """
+    if "realspace_method" in state:
+        return
+    block.realspace_method = "finite_difference"
+    block.set_realspace_method("analytical")

@@ -155,6 +155,7 @@ def _build_descriptor(
         kspace_cutoff=kspace_cutoff,
         include_self_interaction=False,
         pbc_handling=pbc_handling,
+        realspace_method="finite_difference",  # the source-target terms are finite-difference only
     ))
 
 

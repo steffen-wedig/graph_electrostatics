@@ -149,6 +149,7 @@ def test_cross_matches_combined_density_identity_and_gradients(max_l, mode, pbc)
         kspace_cutoff=4.0,
         include_self_interaction=False,
         pbc_handling=mode,
+        realspace_method="finite_difference",  # the source-target terms are finite-difference only
     )
     common = dict(
         k_vectors=geometry["k_vectors"],
@@ -250,6 +251,7 @@ def test_external_source_energy_wraps_base_plus_cross_and_can_be_cleared():
         kspace_cutoff=4.0,
         include_self_interaction=False,
         pbc_handling="realspace",
+        realspace_method="finite_difference",  # the source-target terms are finite-difference only
     )
     wrapped = GTOElectrostaticExternalSourceEnergy.from_energy(base)
     base_kwargs = dict(
@@ -277,7 +279,9 @@ def test_external_source_energy_wraps_base_plus_cross_and_can_be_cleared():
 
 
 def test_external_source_energy_validates_source_lifecycle_and_syncs_pbc_mode():
-    base = GTOElectrostaticEnergy(0, 0.7, 4.0, pbc_handling="realspace")
+    base = GTOElectrostaticEnergy(
+        0, 0.7, 4.0, pbc_handling="realspace", realspace_method="finite_difference"
+    )
     wrapped = GTOElectrostaticExternalSourceEnergy.from_energy(base)
     with pytest.raises(ValueError, match="either all be provided or all be None"):
         wrapped.set_external_sources(external_feats=torch.ones((1, 1)))

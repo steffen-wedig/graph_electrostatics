@@ -78,6 +78,8 @@ class GTOElectrostaticCrossEnergy(torch.nn.Module):
             kspace_cutoff=kspace_cutoff,
             include_self_interaction=False,
             pbc_handling=pbc_handling,
+            # The real-space cross terms re-implement the displaced-charge scheme.
+            realspace_method="finite_difference",
         )
 
     @classmethod
