@@ -17,6 +17,7 @@ from .realspace_electrostatics import (
     RealSpaceMethod,
     _match_tensor_placement,
     _upgrade_legacy_realspace,
+    RealSpaceGeometry,
 )
 from .slabs import (
     CorrectivePotentialBlock,
@@ -456,7 +457,6 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             volume=volume,
             pbc=pbc,
         )
-        self.static_quantities = cache
         return self._forward_dynamic_impl(
             source_feats=source_feats,
             cache=cache,
@@ -472,7 +472,16 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        realspace_geometry: Optional[RealSpaceGeometry] = None,
     ) -> dict:
+        """Everything the features need from the geometry, returned as a value.
+
+        In real space this holds the pair kernels (RealSpaceGeometry), formed once and
+        reused by every forward_dynamic call on the returned value. A caller that
+        shares one real-space geometry between several modules (the features and the
+        energy) prepares it itself, with the merged kernel widths of both, and passes
+        it as realspace_geometry.
+        """
         cache = self._precompute_geometry_impl(
             k_vectors=k_vectors,
             k_norm2=k_norm2,
@@ -483,14 +492,37 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             volume=volume,
             pbc=pbc,
         )
-        self.static_quantities = cache
+        if cache["mode"] == "realspace" and self._has_prepared_realspace():
+            cache["realspace_geometry"] = (
+                realspace_geometry
+                if realspace_geometry is not None
+                else self.realspace_features.prepare(node_positions, batch)
+            )
         return cache
+
+    def _has_prepared_realspace(self) -> bool:
+        """Whether the real-space evaluator takes a prepared geometry (analytical)."""
+        return isinstance(
+            self.realspace_features, RealSpaceAnalyticalElectrostaticFeatures
+        )
 
     def forward_dynamic(
         self,
         cache: dict,
         source_feats: torch.Tensor,
     ) -> torch.Tensor:
+        """Features of one source set [n_nodes, C], or of several independent sets
+        [n_nodes, n_sets, C] (the two spin channels) -> [n_nodes, n_sets, F]."""
+        if source_feats.dim() == 3 and cache.get("realspace_geometry") is None:
+            return torch.stack(
+                [
+                    self._forward_dynamic_impl(
+                        source_feats=source_feats[:, index], cache=cache
+                    )
+                    for index in range(source_feats.shape[1])
+                ],
+                dim=1,
+            )
         return self._forward_dynamic_impl(
             source_feats=source_feats,
             cache=cache,
@@ -766,6 +798,10 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self, source_feats: torch.Tensor, cache: dict
     ) -> torch.Tensor:
         self._require_cache_mode(cache, "realspace")
+        geometry = cache.get("realspace_geometry")
+        if geometry is not None:
+            features, _ = self.realspace_features.evaluate(source_feats, geometry)
+            return features
         features, _, _ = self.realspace_features(
             source_feats=source_feats,
             node_positions=cache["node_positions"],

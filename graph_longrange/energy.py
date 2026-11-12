@@ -17,6 +17,7 @@ from .features import (
 from .gto_utils import GTOBasis, GTOSelfInteractionBlock
 from .realspace_electrostatics import (
     RealSpaceAnalyticalEnergy,
+    RealSpaceGeometry,
     RealSpaceFiniteDiffereneEnergy,
     RealSpaceMethod,
     _match_tensor_placement,
@@ -159,7 +160,29 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         batch: torch.Tensor,
         volume: torch.Tensor,
         pbc: torch.Tensor,
+        realspace_geometry: RealSpaceGeometry | None = None,
     ) -> torch.Tensor:
+        """Energy per structure ([n_graphs], n_graphs = volume.shape[0]).
+
+        realspace_geometry: a geometry the caller prepared for this batch of open
+        structures (prepare_real_space_geometry, with this module's kernel widths
+        among its kernel_widths), shared with other modules. Passing one states that
+        the batch is open: in "auto" mode no periodicity check is made.
+        """
+        if realspace_geometry is not None:
+            if self.pbc_handling not in ("realspace", "auto"):
+                raise ValueError(
+                    "a real-space geometry was passed to an energy block with "
+                    f"pbc_handling={self.pbc_handling!r}"
+                )
+            if not isinstance(self.realspace_energy, RealSpaceAnalyticalEnergy):
+                raise ValueError(
+                    "the finite-difference real-space energy cannot use a prepared "
+                    "geometry; set realspace_method='analytical'"
+                )
+            return self.realspace_energy.evaluate(
+                source_feats, realspace_geometry, batch, int(volume.shape[0])
+            )
         return self._forward_impl(
             k_vectors=k_vectors,
             k_norm2=k_norm2,
@@ -177,7 +200,15 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
+        num_graphs: int,
     ) -> torch.Tensor:
+        if isinstance(self.realspace_energy, RealSpaceAnalyticalEnergy):
+            return self.realspace_energy.evaluate(
+                source_feats,
+                self.realspace_energy.prepare(node_positions, batch),
+                batch,
+                num_graphs,
+            )
         return self.realspace_energy(
             source_feats=source_feats,
             positions=node_positions,
@@ -267,6 +298,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             source_feats=source_feats,
             node_positions=node_positions,
             batch=batch,
+            num_graphs=int(volume.shape[0]),
         )
 
     def _forward_pbc(
