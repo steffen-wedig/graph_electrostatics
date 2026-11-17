@@ -42,20 +42,48 @@ def _smeared_coulomb_kernels_series(
     combined_smearing_width,
     highest_order: int,
 ) -> list[torch.Tensor]:
-    """Taylor-series branch of the smeared-Coulomb kernels (small distances)."""
-    accumulators = [
-        torch.zeros_like(scaled_distance_squared) for _ in range(highest_order + 1)
+    """Taylor-series branch of the smeared-Coulomb kernels (small distances).
+
+    With x = scaled_distance_squared the kernel of order n is
+
+        B_n = sqrt(2/pi) / width^(2n+1) * F_n(x),
+        F_n(x) = sum_k (-x)^k / (k! (2n + 2k + 1)),
+
+    where F_n is the Boys function. Only the highest order is summed, by
+    Horner's rule over SERIES_NUM_TERMS terms with Python-float coefficients.
+    The lower orders follow from the exact downward recursion
+
+        F_n(x) = (exp(-x) + 2x F_{n+1}(x)) / (2n + 1),
+
+    which is stable for x >= 0: the error of F_{n+1} is multiplied by
+    2x / (2n + 1) <= 1 below the crossover. The closed-form branch runs the
+    same recursion upwards, which is what cancels at small x. Everything is
+    straight-line elementwise math with no tensor constants, so it follows
+    the input's dtype and device and is finite through double backward at
+    x = 0.
+    """
+    coefficients = [
+        (-1) ** power
+        / (math.factorial(power) * (2 * highest_order + 2 * power + 1))
+        for power in range(SERIES_NUM_TERMS)
     ]
-    term = torch.ones_like(scaled_distance_squared)
-    for k in range(SERIES_NUM_TERMS):
-        for order in range(highest_order + 1):
-            accumulators[order] = accumulators[order] + term / (2 * order + 2 * k + 1)
-        term = term * (-scaled_distance_squared) / (k + 1)
+    boys_value = torch.full_like(scaled_distance_squared, coefficients[-1])
+    for coefficient in reversed(coefficients[:-1]):
+        boys_value = boys_value * scaled_distance_squared + coefficient
+    boys_values = [boys_value]  # F_highest_order down to F_0
+    if highest_order > 0:
+        exponential = torch.exp(-scaled_distance_squared)
+        for order in range(highest_order - 1, -1, -1):
+            boys_values.append(
+                (exponential + 2.0 * scaled_distance_squared * boys_values[-1])
+                / (2 * order + 1)
+            )
+    boys_values.reverse()
 
     kernels = []
     width_power = 1.0 / combined_smearing_width
     for order in range(highest_order + 1):
-        kernels.append(SQRT_TWO_OVER_PI * width_power * accumulators[order])
+        kernels.append(SQRT_TWO_OVER_PI * width_power * boys_values[order])
         width_power = width_power / combined_smearing_width**2
     return kernels
 
@@ -147,13 +175,9 @@ def smeared_coulomb_kernels(
         raise ValueError(
             f"highest_order must be 0, 1 or 2 (l <= 1), got {highest_order}"
         )
-    # Further work (performance): both branches are evaluated for every edge,
-    # and the unrolled series alone emits ~40 small elementwise kernels, so
-    # batches of many tiny graphs are launch-overhead bound (0.6-0.8x vs the
-    # finite-difference modules on B200; every larger regime wins). The whole
-    # chain is straight-line elementwise math and should fuse into a few
-    # kernels under torch.compile. TODO: verify compilation and double
-    # backward before relying on it.
+    # Both branches are evaluated for every edge. The chain is straight-line
+    # elementwise math, so eager batches of many tiny graphs can be
+    # launch-overhead bound; torch.compile fuses it.
     scaled_distance_squared = distance_squared / (
         2.0 * combined_smearing_width**2
     )
